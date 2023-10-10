@@ -1,0 +1,19 @@
+# Use root/example as user/password credentials
+version: '2.2'
+
+services:
+  ai-response-genie-evalution:
+    container_name: ai_response_genie_evaluation
+    build:
+      context: .
+    restart: always
+    environment:
+      - AI_RESPONSE_GENIE_EVALUATION=/home/code
+      - AI_RESPONSE_GENIE_EVALUATION_DATA=/home/data
+      - DEBUG=False
+      - IN_DOCKER=True
+      - APP_MAIN_PORT=4434
+    volumes:
+      - '/home/user/Projects/ai_response_genie_evaluation/ai_response_genie_evaluation_data:/home/data'
+    network_mode: host
+
