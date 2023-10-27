@@ -9,7 +9,7 @@ controller = DailyAccuracy()
 
 def check_time_and_send():
     now = datetime.datetime.now().time().strftime("%H:%M")
-    target_times = ["09:00"]  # Set your target times here
+    target_times = ["10:55"]  # Set your target times here
 
     if now in target_times:
         send_to_g_chat(data=f"Schedular is started at {datetime.datetime.now()}")

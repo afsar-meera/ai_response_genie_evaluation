@@ -1,7 +1,9 @@
 import datetime
 import string
 import pandas as pd
+import numpy as np
 from sentence_transformers import SentenceTransformer, util
+from nltk.translate.bleu_score import sentence_bleu
 from database import MssqlHandler
 from tools.gchat_logging import send_to_g_chat
 from sheet_link import create_editable_sheet
@@ -53,6 +55,60 @@ class DailyAccuracy:
         # Calculate cosine similarity
         cosine_similarity = util.pytorch_cos_sim(embedding1, embedding2)
         return cosine_similarity.item()
+
+    def calculate_bleu_score(self, reference, candidate):
+        reference_tokens = reference.split()
+        candidate_tokens = candidate.split()
+        return sentence_bleu([reference_tokens], candidate_tokens)
+
+    def categorize_response(self, score):
+        if score >= 0.9:
+            return "Exact Response"
+        elif score >= 0.7:
+            return "Minor Change in the Response"
+        elif score >= 0.5:
+            return "Change in Response - Same meaning"
+        else:
+            return "Suggestion not used"
+
+
+    def agent_response_count(self, category_name, brand_id):
+        READ_SQL_CXN.execute(f"""SELECT ExistingTagID,TagID , channeltype, Brandid, Categoryid, authorid, Channelgroupid
+        FROM {category_name}.dbo.tag_{category_name} WITH (NOLOCK)
+        WHERE Brandid={brand_id}
+        AND  ISNULL(Isdeleted,0)=0  AND ISNULL(ExistingTagID,0)>0
+        AND CONVERT(Date,Dateadd(Minute,330,CreatedDate)) >= '{self.previous_day}'
+        AND CONVERT(Date,Dateadd(Minute,330,CreatedDate)) <= '{self.current_date}';""")
+        df = READ_SQL_CXN.fetch_df()
+        return len(df)
+
+    def flr(self,category_name, brandid):
+        READ_SQL_CXN.execute(f""";With CTE as (
+        Select TagID,TicketID,BrandID
+        From (
+        Select Row_Number() Over (Partition by Object_CaseID Order by RespondedDateTime ) as RN, 
+        MRT.TagID,Object_CaseID as TicketID ,MAIN.BrandID
+        From {category_name}.dbo.MstResponsetimedetails  MRT with(Nolock)
+        INNER JOIN {category_name}.dbo.tag_{category_name} MAIN With(Nolock) ON MAIN.ExistingTagID=MRT.Object_CaseID and MRT.BrandID=Main.BrandID
+        AND MRT.TagID=Main.TagID
+        Where Main.BrandID={brandid}  AND MRT.Object_status=3
+        AND CONVERT(Date,Dateadd(Minute,330,Main.CreatedDate)) >= '{self.previous_day}'
+        AND CONVERT(Date,Dateadd(Minute,330,Main.CreatedDate)) <= '{self.current_date}'
+        )x
+        Where RN=1
+        )
+
+        Select Sum(FirstLevelTAT_Seconds)/Count(Distinct CaseID) as AVG_FLR_ai
+        From {category_name}.dbo.MstCasedetails CD With(Nolock)
+        INNER JOIN {category_name}.dbo.tag_{category_name} MAIN With(Nolock) ON MAIN.ExistingTagID=CD.CaseID and CD.BrandID=Main.BrandID
+        Where CD.Brandid ={brandid}
+         AND MAIN.TagID in (
+         Select ai.TagID from {category_name}.Dbo.MstAIsuggestedTokendetails ai With(Nolock)
+         INNER JOIN CTE ct ON ct.TicketID= ai.ticket_id AND ai.TagID=ct.TagID AND ct.BrandID=ai.BrandID
+         )""")
+        df = READ_SQL_CXN.fetch_df()
+        return df.iloc[0, 0]
+
 
     def brand_genie_data(self):
         READ_SQL_CXN.execute(""" SELECT 
@@ -152,69 +208,69 @@ class DailyAccuracy:
     def alert_formatting(self):
         try:
             brand_df = self.brand_genie_data()
-            # data1 = {'categoryname': ['LocobuzzSupportDB'], 'BrandName': ['ORMXCares']}
+            # data1 = {'categoryname': ['TataDigitalDb'], 'BrandName': ['TATADigital'], 'BrandID': [6954]}
             # brand_df = pd.DataFrame(data1)
-            total_response, kb, success_kb, out_of_kb, success_out_of_kb = [], [], [], [], []
-            kb_success_per, out_of_kb_success_per = [],[]
+            total_response, kb = [], []
+            all_genie_agent_per, flr_count = [], []
+            exact_res, minor_change, same_meaning , not_used = [], [], [], []
             for index, row in brand_df.iterrows():
                 try:
+                    agent_count = self.agent_response_count(row['categoryname'], row['BrandID'])
+
+                    flr_count.append(self.flr(row['categoryname'], row['BrandID']))
                     res1 = self.data(row['categoryname'], row['BrandName'], row['BrandID'])
                     res = self.operations(res1)
-
                     responses = len(res)
+                    if agent_count != 0:
+                        genie_agent_per = (responses/agent_count)*100
+                    else:
+                        genie_agent_per = np.nan
                     total_response.append(responses)
+                    all_genie_agent_per.append(f'{genie_agent_per:.2f}')
 
                     if responses > 0:
                         true_caution = res['caution'].sum()
                         false_caution = responses - true_caution
-                        out_of_kb.append(true_caution)
-                        kb.append(false_caution)
-                        kb_similarity_score, out_of_kb_similarity_score = [], []
-
+                        # out_of_kb.append(true_caution)
+                        kb.append(f'{(false_caution/responses)*100:.2f}')
+                        exact, minor, same_mean, no_use = 0, 0, 0, 0
                         for i, j, k in zip(res["ResponseGenie"].values, res["AgentReply"].values,
                                            res["caution"].values):
-                            similarity_score = self.calculate_sentence_similarity(str(i), str(j))
-                            if not k:
-                                kb_similarity_score.append(similarity_score)
+                            score = self.calculate_sentence_similarity(str(i), str(j))
+                            if score >= 0.9:
+                                exact+=1
+                            elif score >= 0.7:
+                                minor +=1
+                            elif score >= 0.5:
+                                same_mean +=1
                             else:
-                                out_of_kb_similarity_score.append(similarity_score)
+                                no_use +=1
 
-                        similarity_threshold = 0.8
-
-                        kb_count_similarity_score = sum(
-                            1 for score in kb_similarity_score if score >= similarity_threshold)
-                        out_of_kb_count_similarity_score = sum(
-                            1 for score in out_of_kb_similarity_score if score >= similarity_threshold)
-
-                        success_kb.append(kb_count_similarity_score)
-                        success_out_of_kb.append(out_of_kb_count_similarity_score)
-
-                        # Check for division by zero and handle it gracefully
-                        kb_success_per.append(
-                            f'{(kb_count_similarity_score / false_caution) * 100:.2f}' if false_caution != 0 else 'N/A')
-                        out_of_kb_success_per.append(
-                            f'{(out_of_kb_count_similarity_score / true_caution) * 100:.2f}' if true_caution != 0 else 'N/A')
+                        exact_res.append(f'{(exact/responses)*100:.2f}')
+                        minor_change.append(f'{(minor/responses)*100:.2f}')
+                        same_meaning.append(f'{(same_mean/responses)*100:.2f}')
+                        not_used.append(f'{(no_use/responses)*100:.2f}')
 
                     else:
                         kb.append(None)
-                        success_kb.append(None)
-                        out_of_kb.append(None)
-                        success_out_of_kb.append(None)
-                        kb_success_per.append(None)
-                        out_of_kb_success_per.append(None)
+                        exact_res.append(None)
+                        minor_change.append(None)
+                        same_meaning.append(None)
+                        not_used.append(None)
 
                 except Exception as e:
                     print(f"An error occurred for Category: {row['categoryname']}, BrandID: {row['BrandID']}")
                     print(f"Error: {str(e)}")
                     continue
 
-            brand_df["Total Response"] = total_response
-            brand_df["KB "] = kb
-            brand_df["Success of KB"] = success_kb
-            brand_df["% Success of KB"] = kb_success_per
-            brand_df["Out of KB "] = out_of_kb
-            brand_df["Success of Out of KB"] = success_out_of_kb
-            brand_df["% Success of Out of KB"] = out_of_kb_success_per
+            brand_df["Total Suggested Response"] = total_response
+            brand_df["% of Sug VS total replies"] = all_genie_agent_per
+            brand_df["FLR TAT of tickets where Response are suggested "] = flr_count
+            brand_df["% sug form KB"] = kb
+            brand_df["% Exact Response "] = exact_res
+            brand_df["% with minor change "] = minor_change
+            brand_df["% with same meaning "] = same_meaning
+            brand_df["% not used"] = not_used
 
             return brand_df.sort_values(by='Total Response', ascending=False)
             # return brand_df
@@ -224,11 +280,12 @@ class DailyAccuracy:
     def accuracy_update(self):
         final_df = self.alert_formatting()
         final_df = final_df.fillna('').astype(str)
-        # print(final_df)
-        sheet_name = f"Genie Accuracy Alert {self.current_date}"
-        link = create_editable_sheet(final_df, sheet_name)
-        text = f'Date: {self.current_date}\nPlease find Daily Genie Accuracy Alert\nLink: {link}'
-        send_to_g_chat(data=text)
+        print(final_df)
+        final_df.to_csv("accu1.csv")
+        # sheet_name = f"Genie Accuracy Alert {self.current_date}"
+        # link = create_editable_sheet(final_df, sheet_name)
+        # text = f'Date: {self.current_date}\nPlease find Daily Genie Accuracy Alert\nLink: {link}'
+        # send_to_g_chat(data=text)
 
 
 
